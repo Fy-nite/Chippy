@@ -10,7 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\ObjectIR.MonoGame\Adamantite.csproj" />
+    <ProjectReference Include="..\Adamantite\Adamantite.CSharp\Adamantite.csproj" />
     <ProjectReference Include="..\VBlank.csproj" />
   </ItemGroup>
 
