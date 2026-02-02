@@ -31,8 +31,9 @@ namespace Chippy
         private const int NoteColumnWidth = 18;
         private const int EffectColumnWidth = 30;
         private const double MinNoteDurationSeconds = 0.005;
-        private const double MinReleaseSeconds = 0.9;
-        private const double MaxReleaseSeconds = 2;
+        private const double MinReleaseSeconds = 0.025; // shorter minimum release
+        private const double MaxReleaseSeconds = 0.6;   // cap release to ~0.6s
+        private const double MaxNoteDurationSeconds = 0.15; // hard cap for computed note durations to avoid accidental long tails
 
         private readonly Color[] instrumentColors =
         {
@@ -90,16 +91,18 @@ namespace Chippy
 
         private readonly struct QueuedNote
         {
-            public QueuedNote(int channel, SoundEffect effect, float volume)
+            public QueuedNote(int channel, SoundEffect effect, float volume, double durationSeconds)
             {
                 Channel = channel;
                 Effect = effect;
                 Volume = volume;
+                DurationSeconds = durationSeconds;
             }
 
             public int Channel { get; }
             public SoundEffect Effect { get; }
             public float Volume { get; }
+            public double DurationSeconds { get; }
         }
 
         private static readonly Dictionary<Microsoft.Xna.Framework.Input.Keys, int> HexKeyMap = new()
@@ -129,9 +132,10 @@ namespace Chippy
         // Per-instrument ADSR settings
         private readonly float[] instrumentAttack = new float[] { 0.005f, 0.005f, 0.005f, 0.005f };
         private readonly float[] instrumentDecay = new float[] { 0.04f, 0.04f, 0.04f, 0.04f };
-        private readonly float[] instrumentSustain = new float[] { 0.85f, 0.85f, 0.85f, 0.85f };
+        private readonly float[] instrumentSustain = new float[] { 0.60f, 0.60f, 0.60f, 0.60f };
         // Per-instrument release multiplier (applied to computed release seconds)
-        private readonly float[] instrumentRelease = new float[] { 1.0f, 1.0f, 1.0f, 1.0f };
+        // Use slightly shorter default release multipliers to reduce long tails
+        private readonly float[] instrumentRelease = new float[] { 0.6f, 0.6f, 0.6f, 0.6f };
 
         public Game() { }
 
@@ -232,7 +236,8 @@ namespace Chippy
                     if (_hasLastPlay[captured])
                     {
                         StopChannelVoice(captured);
-                        PlayInstrumentNote(_lastInstrument[captured], _lastFrequency[captured], _lastDuration[captured], _lastAmplitude[captured], captured, _lastBaseRelease[captured] * channelRelease[captured]);
+                            // use the last stored base release multiplier so retrigger reflects UI change
+                            PlayInstrumentNote(_lastInstrument[captured], _lastFrequency[captured], _lastDuration[captured], _lastAmplitude[captured], captured, _lastBaseRelease[captured]);
                     }
                 };
                 Console.WriteLine($"[UI] Adding release button for channel {channel} at ({relBtnX},{relBtnY})");
@@ -932,14 +937,15 @@ namespace Chippy
                     float semitoneOffset = step.Effect.ToSemitoneOffset();
                     frequency *= MathF.Pow(2f, semitoneOffset / 12f);
                 }
-                // Determine release multiplier from effect (4Rxx) if present
-                double noteRel = 1.0;
+                // Determine release cap from effect (4Rxx) if present
+                double capSeconds = MaxNoteDurationSeconds;
                 if (step.Effect.IsReleaseCommand())
                 {
-                    noteRel = MapReleaseParam(step.Effect.Param);
+                    capSeconds = MapReleaseCap(step.Effect.Param);
                 }
-                double finalRel = noteRel * Math.Clamp(channelRelease[channel], 0.1, 5.0);
-                System.Diagnostics.Debug.WriteLine($"[Row {row} Ch {channel}] NewNote: StopChannelVoice, then PlayInstrumentNote freq={frequency} dur={durationSeconds} rel={finalRel}");
+                // Note: channelRelease UI remains available but is no longer used to scale envelopes
+                double finalCap = capSeconds;
+                System.Diagnostics.Debug.WriteLine($"[Row {row} Ch {channel}] NewNote: StopChannelVoice, then PlayInstrumentNote freq={frequency} dur={durationSeconds} cap={finalCap}");
                 StopChannelVoice(channel);
                 // store last play params so UI changes can retrigger
                 _hasLastPlay[channel] = true;
@@ -947,8 +953,9 @@ namespace Chippy
                 _lastFrequency[channel] = frequency;
                 _lastDuration[channel] = durationSeconds;
                 _lastAmplitude[channel] = amplitude;
-                _lastBaseRelease[channel] = finalRel;
-                PlayInstrumentNote(instrumentIndex, frequency, durationSeconds, amplitude, channel, finalRel);
+                _lastBaseRelease[channel] = finalCap; // repurpose to store cap seconds for retrigger
+                // pass computed cap seconds so generated PCM matches requested tail length
+                PlayInstrumentNote(instrumentIndex, frequency, durationSeconds, amplitude, channel, finalCap);
             }
         }
 
@@ -998,11 +1005,21 @@ namespace Chippy
                         System.Diagnostics.Debug.WriteLine($"[Audio] Skipping queued note for muted channel {q.Channel}");
                         continue;
                     }
-                    var inst = q.Effect.CreateInstance();
-                    inst.Volume = Math.Clamp(q.Volume, 0f, 1f);
-                    inst.Play();
-                    channelVoices[q.Channel] = inst;
-                    activeVoices.Add(inst);
+                    // Use SoundSystem.Play with a duration so the audio engine will stop/dispose the instance.
+                    if (Subsystem.Sound != null)
+                    {
+                        var inst = Subsystem.Sound.Play(q.Effect, q.DurationSeconds, "Master", q.Volume);
+                        channelVoices[q.Channel] = inst;
+                        activeVoices.Add(inst);
+                    }
+                    else
+                    {
+                        var inst = q.Effect.CreateInstance();
+                        inst.Volume = Math.Clamp(q.Volume, 0f, 1f);
+                        inst.Play();
+                        channelVoices[q.Channel] = inst;
+                        activeVoices.Add(inst);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1029,19 +1046,20 @@ namespace Chippy
             }
         }
 
-        private void PlayInstrumentNote(int instrumentIndex, float frequency, double durationSeconds, float amplitude, int channel, double releaseMultiplier = 1.0)
+        private void PlayInstrumentNote(int instrumentIndex, float frequency, double durationSeconds, float amplitude, int channel, double capSeconds = 0.0)
         {
-            double sustainSeconds = Math.Max(durationSeconds, MinNoteDurationSeconds);
-            double releaseSeconds = Math.Clamp(sustainSeconds * 0.75 * releaseScale * releaseMultiplier, MinReleaseSeconds, MaxReleaseSeconds);
-            double totalDurationSeconds = sustainSeconds + releaseSeconds;
-
-            Console.WriteLine($"PlayInstrumentNote: freq={frequency} durationSeconds={durationSeconds} sustainSeconds={sustainSeconds} releaseSeconds={releaseSeconds} totalDurationSeconds={totalDurationSeconds}");
-
+            double dur = Math.Max(durationSeconds, MinNoteDurationSeconds);
+            // Determine effective cap: use provided capSeconds (from 4R) if > 0, otherwise default to MaxNoteDurationSeconds
+            double effectiveCap = capSeconds > 0.0 ? capSeconds : MaxNoteDurationSeconds;
+            // Clamp excessively large computed durations to prevent very long generated PCM tails
+            if (dur > effectiveCap)
+            {
+                Console.WriteLine($"PlayInstrumentNote: clamping duration {dur:0.###} -> {effectiveCap:0.###}");
+                dur = effectiveCap;
+            }
+            Console.WriteLine($"PlayInstrumentNote: freq={frequency} durationSeconds={dur}");
             int midi = (int)Math.Round(69 + 12 * Math.Log(frequency / 440.0, 2.0));
-            double dur = totalDurationSeconds;
-            // include the release multiplier in the cache key so different release params
-            // (4Rxx, per-channel release, global releaseScale) produce distinct precomputed clips
-            string key = $"chippy_synth_{instrumentIndex}_{midi}_{dur:0.####}_{releaseMultiplier:0.###}";
+            string key = $"chippy_synth_{instrumentIndex}_{midi}_{dur:0.####}";
             try
             {
                 if (Subsystem.Sound != null)
@@ -1056,23 +1074,17 @@ namespace Chippy
                             3 => SimpleSynth.Waveform.Noise,
                             _ => SimpleSynth.Waveform.Sine
                         };
-
                         float synthFreq = instrumentIndex switch
                         {
                             2 => Math.Max(10f, frequency / 2f),
                             3 => 440f,
                             _ => frequency
                         };
-
-                        // Generate PCM for the requested total duration using per-instrument ADSR envelope.
-                        float attack = instrumentAttack[instrumentIndex];
-                        float decay = instrumentDecay[instrumentIndex];
-                        float sustainLevel = instrumentSustain[instrumentIndex];
-                        float relMult = instrumentRelease[instrumentIndex];
-                        var pcm = SimpleSynth.GenerateWavePcm(synthFreq, (float)dur, waveform, 44100, amplitude, 1, attack, decay, sustainLevel, (float)(releaseSeconds * relMult));
+                        // Generate PCM for the requested duration, no envelope.
+                        var pcm = SimpleSynth.GenerateWavePcm(synthFreq, (float)dur, waveform, 44100, amplitude, 1, 0, 0, 1, 0);
                         return pcm;
                     }, 44100, AudioChannels.Mono);
-                    oneShotQueue.Enqueue(new QueuedNote(channel, se, amplitude));
+                    oneShotQueue.Enqueue(new QueuedNote(channel, se, amplitude, dur));
                 }
             }
             catch (Exception ex)
@@ -1136,6 +1148,13 @@ namespace Chippy
             // Map 0x0..0xF into a release multiplier range 0.25 .. 3.0
             double t = Math.Clamp(paramNibble / 15.0, 0.0, 1.0);
             return 0.25 + t * (3.0 - 0.25);
+        }
+
+        private static double MapReleaseCap(int paramByte)
+        {
+            // Map 0x00..0xFF into a cap range 0.01 .. 1.0 seconds
+            double t = Math.Clamp(paramByte / 255.0, 0.0, 1.0);
+            return 0.01 + t * (1.0 - 0.01);
         }
 
     private double GetStepDurationSeconds() => 60.0 / Math.Max(1.0, bpm) * BeatsPerStep;
