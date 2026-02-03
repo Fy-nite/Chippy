@@ -5,7 +5,7 @@ using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Audio;
 using Microsoft.Xna.Framework.Input;
 using ObjectIR.MonoGame.SFX;
-using AsmoV2.AudioEngine;
+using VBlank.AudioEngine;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Diagnostics;
@@ -16,7 +16,7 @@ namespace Chippy
 {
     // Chippy, a chiptune tracker for Asmo
 
-    public class Game : IConsoleGame, AsmoV2.IEngineHost
+    public class Game : IConsoleGame, VBlank.IEngineHost
     {
         // Cache for background gradient row colors
         private static Color[] gradientCache = null;
@@ -46,7 +46,7 @@ namespace Chippy
         // Canvas provided by the VBlank host
         private Canvas canvas = null!;
         // reference to engine for UI access
-        private AsmoV2.AsmoGameEngine? _engine;
+        private VBlank.AsmoGameEngine? _engine;
         // input state tracking
         private KeyboardState prevKeyboardState;
         private KeyboardState currKeyboardState;
@@ -170,7 +170,7 @@ namespace Chippy
             }
         }
 
-        public void SetEngine(AsmoV2.AsmoGameEngine engine)
+        public void SetEngine(VBlank.AsmoGameEngine engine)
         {
             _engine = engine;
             // If we've already initialized (Init called earlier), set up UI now
